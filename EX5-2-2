@@ -1,0 +1,401 @@
+%% run_mimo242_frequency_response_standardized.m
+% Reproducible closed-loop frequency-response comparison for a 2x2 MIMO system.
+%
+% This script compares the average magnitude response of several identification
+% methods against the true plant over repeated Monte Carlo simulations.
+%
+% Methods:
+%   N4SID, SSARX, PBSID, WNSF, CLMOESP, PARSIM, PEM-t, PEM-d
+%
+% Required custom functions on the MATLAB path:
+%   Func_WNSF_MIMO242.m
+%   Func_SSARX.m
+%   Func_PBSID.m
+%   Func_N4SID.m
+%   Func_CLMOESP.m
+%   Func_PARSIME.m
+%
+% Required MATLAB toolboxes:
+%   Control System Toolbox
+%   System Identification Toolbox
+%
+% The random seed and full RNG states are saved with the results.
+
+clearvars;
+close all;
+clc;
+
+%% Configuration
+config = struct();
+
+% Reproducibility. Keep this fixed to reproduce the same random inputs/noise.
+config.seed = 20240531;
+config.rngGenerator = 'twister';
+
+% Experiment settings.
+config.Ts = 1;
+config.sampleLength = 4000;
+config.iterations = 100;
+config.noiseLevel = 1e-2;
+config.referencePerturbationScale = 2 * sqrt(2) * 1e-4;
+config.frequencyGrid = 0.1:0.1:pi;
+
+% Identification settings.
+config.futureWindow = 7;          % ff in the original script
+config.pastWindow = 7;
+config.nHOARX = 50;
+config.runClosedLoop = true;      % original active experiment was closed-loop
+config.runOpenLoop = false;       % optional; disabled to preserve original behavior
+
+% Plot/output settings.
+config.outputDir = fullfile(pwd, 'results_mimo242_frequency_response');
+config.saveFigures = true;
+config.fontSize = 12;
+config.markerSize = 5;
+config.lineWidth = 1;
+
+if ~exist(config.outputDir, 'dir')
+    mkdir(config.outputDir);
+end
+
+rng(config.seed, config.rngGenerator);
+rngStateInitial = rng;
+
+writeSeedFile(config, rngStateInitial);
+% checkDependencies();
+
+%% True system definition
+A_true = [ 0.67  0.67  0     0;
+          -0.67  0.67  0     0;
+           0     0    -0.67 -0.67;
+           0     0     0.67 -0.67];
+
+B_true = [ 0.6598 -0.5256;
+           1.9698  0.4845;
+           4.3171 -0.4879;
+          -2.6436 -0.3416];
+
+K_true = [-0.6968 -0.1474;
+           0.1722  0.5646;
+           0.6484 -0.4660;
+          -0.9400  0.1032];
+
+C_true = [-0.3749  0.0751 -0.5225  0.5830;
+          -0.8977  0.7543  0.1159  0.0982];
+
+D_true = zeros(2);
+A_K_true = A_true - K_true * C_true;
+F_b = [0.1 0; 0 0.1];
+
+n_u = size(B_true, 2);
+n_x = size(A_true, 1);
+n_y = size(C_true, 1);
+n_e = n_y;
+n_z = n_u + n_y;
+
+% Markov/Hankel quantities are saved for diagnostics and reproducibility.
+blockRows = 2 * (n_x - 1);
+pastHorizon = config.nHOARX - blockRows;
+[g_true_markov, G_hankel_true] = computeTrueMarkovHankel( ...
+    A_K_true, B_true, C_true, K_true, config.nHOARX, blockRows, pastHorizon);
+
+%% State-space systems
+OL = ss(A_true, [B_true K_true], C_true, [D_true eye(n_y)], config.Ts);
+CL = feedback(OL, F_b, 1:n_u, 1:n_y, -1);
+
+B_K_true = [B_true K_true];
+G_true_CL = ss(A_K_true, B_K_true, C_true, [D_true D_true], config.Ts);
+G_true = ss(A_true, B_true, C_true, D_true, config.Ts);
+
+poles = struct();
+poles.openLoopPlant = pole(G_true);
+poles.predictorForm = pole(G_true_CL);
+poles.closedLoop = pole(CL);
+
+fprintf('Open-loop plant poles:\n');
+disp(poles.openLoopPlant);
+fprintf('Predictor-form poles:\n');
+disp(poles.predictorForm);
+fprintf('Closed-loop poles:\n');
+disp(poles.closedLoop);
+
+%% Plot pole locations
+figPoles = figure('Name', 'Pole locations', 'Color', 'w');
+plotPoleLocations(G_true, G_true_CL, CL, config);
+if config.saveFigures
+    saveFigure(figPoles, fullfile(config.outputDir, 'pole_locations'));
+end
+
+%% Generate deterministic reference input
+sampleLength = config.sampleLength;
+time = (0:sampleLength-1)';
+referenceSignal = generateReferenceSignal(sampleLength, n_u);
+referenceNoise = config.referencePerturbationScale * randn(sampleLength, n_u);
+referenceInput = referenceSignal + referenceNoise;
+
+%% Monte Carlo simulation
+methodNames = {'N4SID', 'SSARX', 'PBSID', 'WNSF', 'CLMOESP', 'PARSIM', 'PEMt', 'PEMd'};
+nMethods = numel(methodNames);
+nFreq = numel(config.frequencyGrid);
+
+% Dimensions: output channel x input channel x frequency x MC iteration x method.
+magClosedLoop = zeros(n_y, n_u, nFreq, config.iterations, nMethods);
+magOpenLoop = [];
+
+if config.runOpenLoop
+    magOpenLoop = zeros(n_y, n_u, nFreq, config.iterations, nMethods);
+end
+
+for mc = 1:config.iterations
+    fprintf('Monte Carlo iteration %d/%d\n', mc, config.iterations);
+
+    if config.runOpenLoop
+        eOpen = config.noiseLevel * randn(sampleLength, n_e);
+        uOpen = referenceInput;
+        yOpen = lsim(OL, [uOpen eOpen], time);
+        modelsOpen = estimateAllModels(yOpen, uOpen, n_x, config, G_true);
+        magOpenLoop(:, :, :, mc, :) = computeModelMagnitudeResponses(modelsOpen, config.frequencyGrid);
+    end
+
+    if config.runClosedLoop
+        eClosed = config.noiseLevel * randn(sampleLength, n_e);
+        yClosed = lsim(CL, [referenceInput eClosed], time);
+        uClosed = referenceInput - yClosed * F_b.';
+
+        modelsClosed = estimateAllModels(yClosed, uClosed, n_x, config, G_true);
+        magClosedLoop(:, :, :, mc, :) = computeModelMagnitudeResponses(modelsClosed, config.frequencyGrid);
+    end
+end
+
+rngStateFinal = rng;
+
+%% Compute true and average responses
+magTrue = abs(freqresp(G_true, config.frequencyGrid));
+magAvgClosedLoop = squeeze(mean(magClosedLoop, 4));
+magAvgOpenLoop = [];
+
+if config.runOpenLoop
+    magAvgOpenLoop = squeeze(mean(magOpenLoop, 4));
+end
+
+%% Plot averaged closed-loop responses
+if config.runClosedLoop
+    figClosed = figure('Name', 'Closed-loop averaged magnitude responses', 'Color', 'w');
+    plotAverageMagnitudeGrid(config.frequencyGrid, magTrue, magAvgClosedLoop, methodNames, config);
+    sgtitle('Closed-loop identification: average magnitude response');
+
+    if config.saveFigures
+        saveFigure(figClosed, fullfile(config.outputDir, 'closed_loop_average_magnitude'));
+    end
+end
+
+%% Plot averaged open-loop responses, if enabled
+if config.runOpenLoop
+    figOpen = figure('Name', 'Open-loop averaged magnitude responses', 'Color', 'w');
+    plotAverageMagnitudeGrid(config.frequencyGrid, magTrue, magAvgOpenLoop, methodNames, config);
+    sgtitle('Open-loop identification: average magnitude response');
+
+    if config.saveFigures
+        saveFigure(figOpen, fullfile(config.outputDir, 'open_loop_average_magnitude'));
+    end
+end
+
+%% Save numerical results
+resultsFile = fullfile(config.outputDir, 'mimo242_frequency_response_results.mat');
+save(resultsFile, ...
+    'config', 'rngStateInitial', 'rngStateFinal', ...
+    'A_true', 'B_true', 'C_true', 'D_true', 'K_true', 'A_K_true', 'F_b', ...
+    'OL', 'CL', 'G_true', 'G_true_CL', 'poles', ...
+    'g_true_markov', 'G_hankel_true', ...
+    'referenceSignal', 'referenceNoise', 'referenceInput', ...
+    'methodNames', 'magTrue', 'magClosedLoop', 'magAvgClosedLoop', ...
+    'magOpenLoop', 'magAvgOpenLoop');
+
+fprintf('Results saved to:\n  %s\n', resultsFile);
+fprintf('Seed saved to:\n  %s\n', fullfile(config.outputDir, 'random_seed.txt'));
+
+%% Local functions
+function checkDependencies()
+    requiredFunctions = { ...
+        'ss', 'feedback', 'pole', 'lsim', 'freqresp', 'iddata', 'ssest', ...
+        'Func_WNSF_MIMO242', 'Func_SSARX', 'Func_PBSID', 'Func_N4SID', ...
+        'Func_CLMOESP', 'Func_PARSIME'};
+
+    missing = {};
+    for i = 1:numel(requiredFunctions)
+        if exist(requiredFunctions{i}, 'file') ~= 2 && exist(requiredFunctions{i}, 'builtin') ~= 5
+            missing{end+1} = requiredFunctions{i}; %#ok<AGROW>
+        end
+    end
+
+    if ~isempty(missing)
+        error('Missing required functions/toolboxes: %s', strjoin(missing, ', '));
+    end
+end
+
+function writeSeedFile(config, rngStateInitial)
+    seedFile = fullfile(config.outputDir, 'random_seed.txt');
+    fid = fopen(seedFile, 'w');
+    if fid < 0
+        error('Could not create seed file: %s', seedFile);
+    end
+    cleanupObj = onCleanup(@() fclose(fid));
+
+    fprintf(fid, 'Random seed information\n');
+    fprintf(fid, '=======================\n');
+    fprintf(fid, 'seed: %d\n', config.seed);
+    fprintf(fid, 'rngGenerator: %s\n', config.rngGenerator);
+    fprintf(fid, 'MATLAB rng type: %s\n', rngStateInitial.Type);
+    fprintf(fid, 'MATLAB rng seed: %d\n', rngStateInitial.Seed);
+    fprintf(fid, '\nTo reproduce the random stream, run:\n');
+    fprintf(fid, 'rng(%d, ''%s'');\n', config.seed, config.rngGenerator);
+end
+
+function referenceSignal = generateReferenceSignal(sampleLength, n_u)
+    if n_u ~= 2
+        error('generateReferenceSignal currently expects n_u = 2.');
+    end
+
+    k = (1:sampleLength).';
+    referenceSignal = [ ...
+        sin(4/10 * pi * k) + sin(11/20 * pi * k), ...
+        sin(9/20 * pi * k) + sin(6/10 * pi * k)];
+end
+
+function [gTrue, hankelTrue] = computeTrueMarkovHankel(AK, B, C, K, nHOARX, blockRows, pastHorizon)
+    n_y = size(C, 1);
+    n_u = size(B, 2);
+    n_z = n_u + n_y;
+
+    gTrue = C * [B K];
+    for i = 1:(nHOARX - 1)
+        gTrue = [gTrue, C * (AK^i) * [B K]]; %#ok<AGROW>
+    end
+
+    hankelTrue = zeros(n_y * (blockRows + 1), n_z * pastHorizon);
+    for row = 1:(blockRows + 1)
+        rowIdx = (n_y * (row - 1) + 1):(n_y * row);
+        for col = 1:pastHorizon
+            colIdx = (n_z * (col - 1) + 1):(n_z * col);
+            markovIdx = (n_z * (row + col - 2) + 1):(n_z * (row + col - 1));
+            hankelTrue(rowIdx, colIdx) = gTrue(:, markovIdx);
+        end
+    end
+end
+
+function models = estimateAllModels(y, u, n_x, config, G_true)
+    ff = config.futureWindow;
+    pp = config.pastWindow;
+    nHOARX = config.nHOARX;
+    Ts = config.Ts;
+
+    models = cell(1, 8);
+
+    [A_N4SID, B_N4SID, C_N4SID, D_N4SID, ~, ~, ~, ~] = Func_N4SID(y, u, ff, n_x, [], 'CVA');
+    models{1} = ss(A_N4SID, B_N4SID, C_N4SID, D_N4SID, Ts);
+
+    [A_SSARX, B_SSARX, C_SSARX, D_SSARX, ~] = Func_SSARX(u, y, n_x, ff, pp, nHOARX, nHOARX, 0);
+    models{2} = ss(A_SSARX, B_SSARX, C_SSARX, D_SSARX, Ts);
+
+    [A_PBSID, B_PBSID, C_PBSID, D_PBSID, ~, ~] = Func_PBSID(y', u', ff, pp, n_x, 0);
+    models{3} = ss(A_PBSID, B_PBSID, C_PBSID, D_PBSID, Ts);
+
+    [A_WNSF, B_WNSF, C_WNSF, D_WNSF, ~] = Func_WNSF_MIMO242(u, y, n_x, nHOARX);
+    models{4} = ss(A_WNSF, B_WNSF, C_WNSF, D_WNSF, Ts);
+
+    [A_CLMOESP, B_CLMOESP, C_CLMOESP, D_CLMOESP, ~] = Func_CLMOESP(y, u, n_x, ff, pp);
+    models{5} = ss(A_CLMOESP, B_CLMOESP, C_CLMOESP, D_CLMOESP, Ts);
+
+    [A_PARSIM, B_PARSIM, C_PARSIM, D_PARSIM, ~] = Func_PARSIME(y, u, n_x, ff, pp, 0);
+    models{6} = ss(A_PARSIM, B_PARSIM, C_PARSIM, D_PARSIM, Ts);
+
+    data = iddata(y, u, Ts);
+    models{7} = ssest(data, G_true);                         % PEM initialized with true model
+    models{8} = ssest(data, n_x, 'Form', 'canonical');        % PEM default/canonical initialization
+end
+
+function magnitudes = computeModelMagnitudeResponses(models, frequencyGrid)
+    nMethods = numel(models);
+    [n_y, n_u] = size(models{1}.D);
+    nFreq = numel(frequencyGrid);
+
+    magnitudes = zeros(n_y, n_u, nFreq, 1, nMethods);
+    for methodIdx = 1:nMethods
+        response = abs(freqresp(models{methodIdx}, frequencyGrid));
+        magnitudes(:, :, :, 1, methodIdx) = response;
+    end
+end
+
+function plotPoleLocations(G_true, G_true_CL, CL, config)
+    hold on;
+    [cx, cy] = pol2cart(linspace(0, 2*pi, 100), ones(1, 100));
+    plot(cx, cy, 'k');
+    plot(real(pole(G_true)), imag(pole(G_true)), 'r+', ...
+        'LineWidth', 2, 'MarkerSize', config.markerSize * 4);
+    plot(real(pole(G_true_CL)), imag(pole(G_true_CL)), 'bx', ...
+        'LineWidth', 2, 'MarkerSize', config.markerSize * 4);
+    plot(real(pole(CL)), imag(pole(CL)), 'ko', ...
+        'LineWidth', 2, 'MarkerSize', config.markerSize * 4);
+    axis equal;
+    grid off;
+    xlabel('Real part');
+    ylabel('Imaginary part');
+    legend({'Unit circle', 'Plant', 'Predictor form', 'Closed loop'}, ...
+        'Location', 'best', 'Interpreter', 'latex');
+    title('Pole locations');
+end
+
+function plotAverageMagnitudeGrid(frequencyGrid, magTrue, magAvg, methodNames, config)
+    n_y = size(magTrue, 1);
+    n_u = size(magTrue, 2);
+
+    lineSpecs = { ...
+        'b--', ...  % N4SID
+        'b:',  ...  % SSARX
+        'b-',  ...  % PBSID
+        'k--', ...  % WNSF
+        'g-.', ...  % CLMOESP
+        'm-.', ...  % PARSIM
+        'k:',  ...  % PEM-t
+        'k-'   ...  % PEM-d
+        };
+
+    for outputIdx = 1:n_y
+        for inputIdx = 1:n_u
+            subplot(n_y, n_u, (outputIdx - 1) * n_u + inputIdx);
+            semilogy(frequencyGrid, squeeze(magTrue(outputIdx, inputIdx, :)), ...
+                'r-', 'LineWidth', config.lineWidth + 1);
+            hold on;
+
+            for methodIdx = 1:numel(methodNames)
+                semilogy(frequencyGrid, squeeze(magAvg(outputIdx, inputIdx, :, methodIdx)), ...
+                    lineSpecs{methodIdx}, 'LineWidth', config.lineWidth);
+            end
+
+            grid off;
+            title(sprintf('G_{%d%d}', outputIdx, inputIdx));
+
+            if inputIdx == 1
+                ylabel('Avg. magnitude', 'FontSize', config.fontSize);
+            end
+            if outputIdx == n_y
+                xlabel('Frequency (rad/sample)', 'FontSize', config.fontSize);
+            end
+            if outputIdx == 1 && inputIdx == 1
+                legend(['True', methodNames], 'Location', 'best', 'Interpreter', 'latex');
+            end
+        end
+    end
+end
+
+function saveFigure(figHandle, basePath)
+    savefig(figHandle, [basePath '.fig']);
+
+    if exist('exportgraphics', 'file') == 2
+        exportgraphics(figHandle, [basePath '.png'], 'Resolution', 300);
+        exportgraphics(figHandle, [basePath '.pdf'], 'ContentType', 'vector');
+    else
+        print(figHandle, [basePath '.png'], '-dpng', '-r300');
+        print(figHandle, [basePath '.pdf'], '-dpdf', '-bestfit');
+    end
+end
