@@ -1,0 +1,515 @@
+%% RUN_SISO_ARMAX_REALIZATION_FIT_STANDARDIZED
+% Compare identification methods for a SISO ARMAX realization example under
+% open-loop and closed-loop operation.
+%
+% This script standardizes the original experiment by:
+%   1. using a fixed random seed for reproducibility;
+%   2. saving the seed and RNG state together with the results;
+%   3. collecting user settings in a single configuration block;
+%   4. saving all figures and numerical results to an output folder;
+%   5. correcting the WNSF-OLS model-selection index used in the original code.
+%
+% Required toolboxes:
+%   - Control System Toolbox
+%   - System Identification Toolbox
+%
+% Required project functions on the MATLAB path:
+%   - Func_N4SID.m
+%   - Func_PARSIME.m
+%   - Func_PBSID.m
+%   - Func_WNSF_ARMAX.m
+%   - Func_WNSF_SISO.m
+%   - Func_NSF_SISO.m
+
+clearvars;
+close all;
+clc;
+
+%% Configuration
+
+config = struct();
+
+% Reproducibility.
+config.seed = 20240531;
+config.rngGenerator = 'twister';
+
+% Experiment settings.
+config.iteration = 100;
+config.sample = 6000;
+config.sampleTime = 1;
+config.orderEvaluation = 100;
+
+% Model-order/grid settings.
+config.fSet = 5:5:50;              % past/future horizons tested for subspace methods
+config.nHOARXSet = 50:10:150;      % high-order ARX orders tested for WNSF methods
+
+% Closed-loop controller.
+config.feedbackGain = -0.5;
+
+% Output settings.
+config.outputDir = fullfile(pwd, 'results_siso_armax_realization_fit');
+config.saveFigures = true;
+config.figureResolution = 300;
+
+% Plot settings.
+plotCfg = struct();
+plotCfg.markerSize = 5;
+plotCfg.lineWidth = 1;
+plotCfg.fontSize = 8;
+plotCfg.axisFont = 'Times';
+
+% Method labels, in the same order as fitOpen and fitClosed.
+methodLabels = {'N4SID', 'SSARX', 'PBSIDo', 'WNSFar', ...
+                'WNSFss(o)', 'WNSFss(w)', 'PEMd', 'PEMt'};
+
+if ~exist(config.outputDir, 'dir')
+    mkdir(config.outputDir);
+end
+
+rng(config.seed, config.rngGenerator);
+rngStateInitial = rng;
+
+writeRandomSeedFile(config, rngStateInitial);
+
+assertRequiredFunctions();
+
+%% Define the SISO ARMAX system
+
+% Preferred example: both G and H have resonance peaks.
+fCoeff = [0, 0, 0, 0.7^4];
+bCoeff = [0.10, 0.05, 0.02, 0.01];
+aCoeff = [-2.48, 3.08, -2.24, 0.81];
+
+F = [1 fCoeff];
+L = [0 bCoeff];
+A = [1 aCoeff];
+
+n_x = numel(fCoeff);
+I_n_x = eye(n_x);
+
+A_K_true = [-aCoeff.' I_n_x(:, 1:n_x-1)];
+B_true   = bCoeff.';
+C_true   = [1 zeros(1, n_x-1)];
+D_true   = zeros(1, 1);
+K_true   = (aCoeff - fCoeff).';
+A_true   = A_K_true + K_true * C_true;
+
+n_y = size(C_true, 1);
+n_e = n_y;
+n_u = size(B_true, 2);
+
+na = n_x;
+nb = n_x;
+nc = n_x;
+nk = 1;
+
+Ts = config.sampleTime;
+
+mtrue = ss(A_true, B_true, C_true, D_true, Ts); %#ok<NASGU>
+armaxTrue = idpoly(F, L, A);
+
+% Open-loop system and transfer functions.
+OL = ss(A_true, [B_true K_true], C_true, [D_true eye(n_y)], Ts); %#ok<NASGU>
+G_true = ss(A_true, B_true, C_true, D_true, Ts);
+H_true = ss(A_true, K_true, C_true, 1, Ts);
+
+% Closed-loop transfer functions.
+feedbackGain = config.feedbackGain;
+G_ur = 1 / (1 + G_true * feedbackGain);
+G_ue = -H_true * feedbackGain / (1 + G_true * feedbackGain);
+G_yr = G_true / (1 + G_true * feedbackGain); %#ok<NASGU>
+G_ye = H_true / (1 + G_true * feedbackGain); %#ok<NASGU>
+
+%% Identification options
+
+pemOptions = armaxOptions;
+pemOptions.SearchOption.Tolerance = 1e-5;
+pemOptions.Advanced.ErrorThreshold = 0;
+
+%% Diagnostic plots of the true system
+
+figPoles = figure('Name', 'Pole Map');
+hold on;
+[cx, cy] = pol2cart(linspace(0, 2*pi, 100), ones(1, 100));
+plot(cx, cy, 'k');
+plot(real(pole(G_true)), real(0*pole(G_true)) + imag(pole(G_true)), ...
+     'r+', 'LineWidth', 2, 'MarkerSize', plotCfg.markerSize*4);
+plot(real(pole(G_ur)), real(0*pole(G_ur)) + imag(pole(G_ur)), ...
+     'bx', 'LineWidth', 2, 'MarkerSize', plotCfg.markerSize*4);
+plot(real(pole(H_true)), real(0*pole(H_true)) + imag(pole(H_true)), ...
+     'k^', 'LineWidth', 2, 'MarkerSize', plotCfg.markerSize*4);
+axis equal;
+grid off;
+xlabel('Real');
+ylabel('Imaginary');
+legend({'Unit circle', 'Poles of G', 'Poles of closed-loop transfer', 'Poles of H'}, ...
+       'Location', 'best');
+formatAxes(gca, plotCfg);
+
+figBode = figure('Name', 'True System Bode Magnitudes');
+bodemag(G_true, 'k');
+hold on;
+bodemag(H_true, 'k--');
+legend({'G', 'H'}, 'Location', 'best');
+grid off;
+formatAxes(gca, plotCfg);
+
+%% Monte Carlo experiment
+
+t = (0:config.sample-1).';
+
+fitOpen = zeros(config.iteration, numel(methodLabels));
+fitClosed = zeros(config.iteration, numel(methodLabels));
+
+bestIndex = struct();
+bestIndex.open.subspace = zeros(config.iteration, 3);  % N4SID, SSARX, PBSID
+bestIndex.open.wnsf = zeros(config.iteration, 3);      % WNSFar, WNSFss(w), WNSFss(o)
+bestIndex.closed.subspace = zeros(config.iteration, 3);
+bestIndex.closed.wnsf = zeros(config.iteration, 3);
+
+for mc = 1:config.iteration
+    fprintf('Monte Carlo iteration %d/%d\n', mc, config.iteration);
+
+    %% Open-loop data generation
+
+    rOpen = randn(config.sample, n_u);
+    eOpen = randn(config.sample, n_e);
+
+    uOpen = rOpen;
+    yOpen = lsim(G_true, uOpen, t) + lsim(H_true, eOpen, t);
+
+    dataOpen = iddata(yOpen, uOpen, Ts);
+
+    [subspaceOpen, bestIndex.open.subspace(mc, :)] = ...
+        estimateSubspaceModels(yOpen, uOpen, t, n_x, config.fSet, Ts);
+
+    [wnsfOpen, bestIndex.open.wnsf(mc, :)] = ...
+        estimateWnsfModels(yOpen, uOpen, t, n_x, config.nHOARXSet, Ts);
+
+    pemOpen = estimatePemModels(dataOpen, armaxTrue, n_x, na, nb, nc, nk, pemOptions);
+
+    fitOpen(mc, :) = evaluateMethodFits(G_true, subspaceOpen, wnsfOpen, pemOpen, ...
+                                        config.orderEvaluation);
+
+    %% Closed-loop data generation
+
+    rClosed = randn(config.sample, n_u);
+    eClosed = randn(config.sample, n_e);
+
+    uClosed = lsim(G_ur, rClosed, t) + lsim(G_ue, eClosed, t);
+    yClosed = lsim(G_true, uClosed, t) + lsim(H_true, eClosed, t);
+
+    dataClosed = iddata(yClosed, uClosed, Ts);
+
+    [subspaceClosed, bestIndex.closed.subspace(mc, :)] = ...
+        estimateSubspaceModels(yClosed, uClosed, t, n_x, config.fSet, Ts);
+
+    [wnsfClosed, bestIndex.closed.wnsf(mc, :)] = ...
+        estimateWnsfModels(yClosed, uClosed, t, n_x, config.nHOARXSet, Ts);
+
+    pemClosed = estimatePemModels(dataClosed, armaxTrue, n_x, na, nb, nc, nk, pemOptions);
+
+    fitClosed(mc, :) = evaluateMethodFits(G_true, subspaceClosed, wnsfClosed, pemClosed, ...
+                                          config.orderEvaluation);
+end
+
+rngStateFinal = rng;
+
+%% Plot results
+
+figOpen = plotFitBoxchart(fitOpen, methodLabels, 'Open-loop FIT', plotCfg);
+figClosed = plotFitBoxchart(fitClosed, methodLabels, 'Closed-loop FIT', plotCfg);
+
+%% Save results
+
+resultsFile = fullfile(config.outputDir, 'siso_armax_realization_fit_results.mat');
+save(resultsFile, ...
+     'config', 'rngStateInitial', 'rngStateFinal', ...
+     'fitOpen', 'fitClosed', 'bestIndex', 'methodLabels', ...
+     'A_K_true', 'A_true', 'B_true', 'C_true', 'D_true', 'K_true', ...
+     'F', 'L', 'A', 'fCoeff', 'bCoeff', 'aCoeff');
+
+if config.saveFigures
+    saveFigure(figPoles,  config.outputDir, 'true_system_pole_map', config.figureResolution);
+    saveFigure(figBode,   config.outputDir, 'true_system_bode_magnitude', config.figureResolution);
+    saveFigure(figOpen,   config.outputDir, 'fit_boxchart_open_loop', config.figureResolution);
+    saveFigure(figClosed, config.outputDir, 'fit_boxchart_closed_loop', config.figureResolution);
+end
+
+fprintf('\nExperiment complete.\n');
+fprintf('Results saved to:\n  %s\n', resultsFile);
+fprintf('Random seed saved to:\n  %s\n', fullfile(config.outputDir, 'random_seed.txt'));
+
+%% Local functions
+
+function assertRequiredFunctions()
+%ASSERTREQUIREDFUNCTIONS Check that custom project functions are available.
+
+requiredFunctions = { ...
+    'Func_N4SID', ...
+    'Func_PARSIME', ...
+    'Func_PBSID', ...
+    'Func_WNSF_ARMAX', ...
+    'Func_WNSF_SISO', ...
+    'Func_NSF_SISO'};
+
+missing = {};
+for i = 1:numel(requiredFunctions)
+    if exist(requiredFunctions{i}, 'file') ~= 2
+        missing{end+1} = requiredFunctions{i}; %#ok<AGROW>
+    end
+end
+
+if ~isempty(missing)
+    error('Missing required project function(s) on MATLAB path: %s', ...
+          strjoin(missing, ', '));
+end
+end
+
+function writeRandomSeedFile(config, rngStateInitial)
+%WRITERANDOMSEEDFILE Save random-seed information in a readable text file.
+
+seedFile = fullfile(config.outputDir, 'random_seed.txt');
+fid = fopen(seedFile, 'w');
+if fid < 0
+    error('Could not create random seed file: %s', seedFile);
+end
+
+cleanupObj = onCleanup(@() fclose(fid));
+
+fprintf(fid, 'Random seed information\n');
+fprintf(fid, '=======================\n');
+fprintf(fid, 'seed: %d\n', config.seed);
+fprintf(fid, 'generator: %s\n', config.rngGenerator);
+fprintf(fid, 'rng.Type: %s\n', rngStateInitial.Type);
+fprintf(fid, 'rng.Seed: %d\n', rngStateInitial.Seed);
+fprintf(fid, '\nTo reproduce the random sequence, run:\n');
+fprintf(fid, 'rng(%d, ''%s'');\n', config.seed, config.rngGenerator);
+end
+
+function [models, bestIdx] = estimateSubspaceModels(y, u, t, n_x, fSet, Ts)
+%ESTIMATESUBSPACEMODELS Select N4SID, SSARX/PARSIME, and PBSID by simulation error.
+
+numMethods = 3;
+numCandidates = numel(fSet);
+
+costSet = inf(numMethods, numCandidates);
+modelSet = cell(numMethods, numCandidates);
+
+for fi = 1:numCandidates
+    pastWindow = fSet(fi);
+    futureWindow = pastWindow;
+
+    [A_N4SID, B_N4SID, C_N4SID, D_N4SID, K_N4SID, ~, ~, ~] = ...
+        Func_N4SID(y, u, pastWindow, n_x, [], 'CVA');
+
+    [A_SSARX, B_SSARX, C_SSARX, D_SSARX, K_SSARX] = ...
+        Func_PARSIME(y, u, n_x, pastWindow, futureWindow, 0);
+
+    [A_PBSID, B_PBSID, C_PBSID, D_PBSID, K_PBSID, ~] = ...
+        Func_PBSID(y.', u.', pastWindow, futureWindow, n_x, 0);
+
+    modelSet{1, fi} = {A_N4SID, B_N4SID, C_N4SID, D_N4SID, K_N4SID};
+    modelSet{2, fi} = {A_SSARX, B_SSARX, C_SSARX, D_SSARX, K_SSARX};
+    modelSet{3, fi} = {A_PBSID, B_PBSID, C_PBSID, D_PBSID, K_PBSID};
+
+    for method = 1:numMethods
+        sys = ss(modelSet{method, fi}{1}, modelSet{method, fi}{2}, ...
+                 modelSet{method, fi}{3}, modelSet{method, fi}{4}, Ts);
+
+        ySim = lsim(sys, u, t);
+        costSet(method, fi) = sum((y - ySim).^2, 'all');
+    end
+end
+
+models = struct();
+bestIdx = zeros(1, numMethods);
+
+for method = 1:numMethods
+    [~, idx] = min(costSet(method, :), [], 2);
+    bestIdx(method) = idx;
+
+    selected = modelSet{method, idx};
+    sys = ss(selected{1}, selected{2}, selected{3}, selected{4}, Ts);
+
+    switch method
+        case 1
+            models.N4SID = sys;
+        case 2
+            models.SSARX = sys;
+        case 3
+            models.PBSID = sys;
+    end
+end
+end
+
+function [models, bestIdx] = estimateWnsfModels(y, u, t, n_x, nHOARXSet, Ts)
+%ESTIMATEWNSFMODELS Select WNSF-ARMAX, WNSF-WLS, and NSF/WNSF-OLS models.
+
+numMethods = 3;
+numCandidates = numel(nHOARXSet);
+
+costSet = inf(numMethods, numCandidates);
+modelSet = cell(numMethods, numCandidates);
+
+for hi = 1:numCandidates
+    nHOARX = nHOARXSet(hi);
+
+    [A_WNSF_ARMAX, B_WNSF_ARMAX, C_WNSF_ARMAX, D_WNSF_ARMAX, K_WNSF_ARMAX] = ...
+        Func_WNSF_ARMAX(u, y, n_x, nHOARX);
+
+    [A_WNSF, B_WNSF, C_WNSF, D_WNSF, K_WNSF] = ...
+        Func_WNSF_SISO(u, y, n_x, nHOARX);
+
+    [A_WNSF_OLS, B_WNSF_OLS, C_WNSF_OLS, D_WNSF_OLS, K_WNSF_OLS] = ...
+        Func_NSF_SISO(u, y, n_x, nHOARX);
+
+    modelSet{1, hi} = {A_WNSF_ARMAX, B_WNSF_ARMAX, C_WNSF_ARMAX, D_WNSF_ARMAX, K_WNSF_ARMAX};
+    modelSet{2, hi} = {A_WNSF,       B_WNSF,       C_WNSF,       D_WNSF,       K_WNSF};
+    modelSet{3, hi} = {A_WNSF_OLS,   B_WNSF_OLS,   C_WNSF_OLS,   D_WNSF_OLS,   K_WNSF_OLS};
+
+    for method = 1:numMethods
+        sys = ss(modelSet{method, hi}{1}, modelSet{method, hi}{2}, ...
+                 modelSet{method, hi}{3}, modelSet{method, hi}{4}, Ts);
+
+        ySim = lsim(sys, u, t);
+        costSet(method, hi) = sum((y - ySim).^2, 'all');
+    end
+end
+
+models = struct();
+bestIdx = zeros(1, numMethods);
+
+for method = 1:numMethods
+    [~, idx] = min(costSet(method, :), [], 2);
+    bestIdx(method) = idx;
+
+    selected = modelSet{method, idx};
+    sys = ss(selected{1}, selected{2}, selected{3}, selected{4}, Ts);
+
+    switch method
+        case 1
+            models.WNSF_ARMAX = sys;
+        case 2
+            models.WNSF_WLS = sys;
+        case 3
+            % This uses the WNSF/NSF OLS index. The original code
+            % accidentally reused the WNSF-WLS index here.
+            models.WNSF_OLS = sys;
+    end
+end
+end
+
+function models = estimatePemModels(dataEst, armaxTrue, n_x, na, nb, nc, nk, pemOptions)
+%ESTIMATEPEMMODELS Estimate direct PEM models used in the comparison.
+
+models = struct();
+
+models.PEM_true = armax(dataEst, armaxTrue, pemOptions);
+models.PEM_default = armax(dataEst, [na nb nc nk], pemOptions);
+
+sysSS = n4sid(dataEst, n_x, ...
+    'N4Weight', 'SSARX', ...
+    'Focus', 'prediction', ...
+    'Feedthrough', false);
+
+sysARMAX = idpoly(sysSS);
+
+Ass = sysARMAX.A;
+Bss = sysARMAX.B;
+Css = sysARMAX.C;
+
+Ass = [1 Ass(:, 2:end)];
+Bss = [0 Bss(:, 2:end)];
+Css = [1 Css(:, 2:end)];
+
+armaxSSARX = idpoly(Ass, Bss, Css); %#ok<NASGU>
+
+% Kept for completeness and possible future use, but not included in the
+% final FIT vector because the original plotted comparison used PEMd and PEMt.
+% Uncomment if you want to evaluate it:
+% models.PEM_ssarx = armax(dataEst, armaxSSARX, pemOptions);
+end
+
+function fit = evaluateMethodFits(G_true, subspaceModels, wnsfModels, pemModels, orderEvaluation)
+%EVALUATEMETHODFITS Compute impulse-response FIT values for all methods.
+
+gTrue = impulseVector(G_true, orderEvaluation);
+
+fit = 100 * [ ...
+    impulseFit(gTrue, subspaceModels.N4SID, orderEvaluation), ...
+    impulseFit(gTrue, subspaceModels.SSARX, orderEvaluation), ...
+    impulseFit(gTrue, subspaceModels.PBSID, orderEvaluation), ...
+    impulseFit(gTrue, wnsfModels.WNSF_ARMAX, orderEvaluation), ...
+    impulseFit(gTrue, wnsfModels.WNSF_OLS, orderEvaluation), ...
+    impulseFit(gTrue, wnsfModels.WNSF_WLS, orderEvaluation), ...
+    impulseFit(gTrue, pemModels.PEM_default, orderEvaluation), ...
+    impulseFit(gTrue, pemModels.PEM_true, orderEvaluation)];
+end
+
+function fitValue = impulseFit(gTrue, model, orderEvaluation)
+%IMPULSEFIT Return 1 - normalized impulse-response error.
+
+gModel = impulseVector(model, orderEvaluation);
+denominator = norm(gTrue - mean(gTrue));
+
+if denominator == 0
+    fitValue = NaN;
+else
+    fitValue = 1 - norm(gTrue - gModel) / denominator;
+end
+end
+
+function g = impulseVector(model, orderEvaluation)
+%IMPULSEVECTOR Return impulse response as a column vector, excluding k = 0.
+
+g = impulse(model, orderEvaluation);
+g = squeeze(g);
+
+if isrow(g)
+    g = g.';
+end
+
+g = g(2:end);
+g = g(:);
+end
+
+function fig = plotFitBoxchart(fitValues, methodLabels, figName, plotCfg)
+%PLOTFITBOXCHART Plot a FIT boxchart with standardized formatting.
+
+fig = figure('Name', figName);
+boxchart(fitValues, ...
+    'BoxFaceColor', 'black', ...
+    'MarkerStyle', 'x', ...
+    'MarkerColor', 'black', ...
+    'BoxFaceAlpha', 0);
+
+grid off;
+xticklabels(methodLabels);
+ylabel('FIT', 'FontSize', plotCfg.fontSize);
+
+ax = gca;
+ax.XAxis.FontSize = plotCfg.fontSize;
+ax.YAxis.FontSize = plotCfg.fontSize;
+ax.TickLabelInterpreter = 'latex';
+
+if isprop(ax, 'XRuler') && isprop(ax.XRuler, 'Axle')
+    ax.XRuler.Axle.Visible = 'off';
+end
+
+formatAxes(ax, plotCfg);
+end
+
+function formatAxes(ax, plotCfg)
+%FORMATAXES Apply a consistent axis style.
+
+ax.Box = 'off';
+ax.TickDir = 'out';
+ax.LineWidth = 1.2;
+ax.FontSize = plotCfg.fontSize;
+
+if isfield(plotCfg, 'axisFont')
+    ax.FontName = plotCfg.axisFont;
+end
+end
+
