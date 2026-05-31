@@ -1,0 +1,274 @@
+%% run_siso_counter_crlb_standardized.m
+% RUN_SISO_COUNTER_CRLB_STANDARDIZED
+% Monte Carlo comparison of WNSF estimates against CRLB for open-loop and
+% closed-loop SISO ARMAX simulations.
+%
+% Requirements:
+%   - MATLAB Control System Toolbox
+%   - MATLAB System Identification Toolbox
+%   - Func_WNSF_SISO2.m available on the MATLAB path
+%
+% Reproducibility:
+%   This script fixes MATLAB's random-number generator via rng(seed,"twister").
+%   Other users should obtain the same random inputs/noise, assuming the same
+%   MATLAB/toolbox versions and deterministic behavior inside Func_WNSF_SISO2.
+
+clearvars;
+close all;
+clc;
+
+%% Configuration
+seed = 20240531;
+rng(seed, "twister");
+
+sampleSet = [600 1000 3000 6000 10000];
+hoarxOrderSet = 40:10:100;
+numIterations = 1000;
+
+if numel(hoarxOrderSet) < numel(sampleSet)
+    error("hoarxOrderSet must contain at least as many entries as sampleSet.");
+end
+
+sigmaR = 1;
+sigmaE = 1;
+sampleTime = 1;
+
+lineWidth = 1;
+fontSize = 10;
+
+outputDir = fullfile(pwd, "results");
+if ~exist(outputDir, "dir")
+    mkdir(outputDir);
+end
+
+%% Define true ARMAX system
+% ARMAX polynomials are represented in z^-1:
+%   F(z^-1)y(t) = L(z^-1)u(t) + A(z^-1)e(t)
+fTrue = [-1.5, 0.7];
+bTrue = [1, 0.5];
+aTrue = [-0.8, 0.2];
+
+thetaTrue = [fTrue, bTrue, aTrue];
+
+Fpoly = [1, fTrue];
+Lpoly = [0, bTrue];
+Apoly = [1, aTrue];
+
+nx = numel(fTrue);
+Inx = eye(nx);
+
+AKTrue = [-aTrue(:), Inx(:, 1:nx-1)];
+BTrue = bTrue(:);
+CTrue = [1, zeros(1, nx-1)];
+DTrue = 0;
+KTrue = (aTrue - fTrue).';
+ATrue = AKTrue + KTrue * CTrue;
+
+numTheta = 3 * nx;
+ny = size(CTrue, 1);
+
+% Objects retained for reproducibility / inspection.
+modelTrue = ss(ATrue, BTrue, CTrue, DTrue, sampleTime); %#ok<NASGU>
+armaxTrue = idpoly(Fpoly, Lpoly, Apoly); %#ok<NASGU>
+
+%% Open-loop and closed-loop systems
+OL = ss(ATrue, [BTrue, KTrue], CTrue, [DTrue, eye(ny)], sampleTime);
+
+BKTrue = [BTrue, KTrue];
+GTrueCL = ss(AKTrue, BKTrue, CTrue, [DTrue, DTrue], sampleTime); %#ok<NASGU>
+
+GTrue = ss(ATrue, BTrue, CTrue, DTrue, sampleTime);
+HTrue = ss(ATrue, KTrue, CTrue, eye(ny), sampleTime);
+
+Hu = tf([0.63 -2.08 2.82 -1.86 0.5], ...
+        [1 -2.65 3.11 -1.75 0.39], ...
+        sampleTime, "Variable", "z^-1");
+
+Gur = 5 / (1 + GTrue * Hu);
+Gue = -HTrue * Hu / (1 + GTrue * Hu);
+
+%% Fisher information matrices / CRLB
+z = tf("z", sampleTime);
+
+Asym = 1;
+Fsym = 1;
+Lsym = 0;
+for idx = 1:nx
+    Fsym = Fsym + fTrue(idx) * z^(-idx);
+    Lsym = Lsym + bTrue(idx) * z^(-idx);
+    Asym = Asym + aTrue(idx) * z^(-idx);
+end
+
+Gsym = Lsym / Fsym;
+Hsym = Asym / Fsym;
+
+Vnx = z^(-1);
+for idx = 2:nx
+    Vnx = [Vnx; z^(-idx)]; %#ok<AGROW>
+end
+zeroNx = zeros(nx, 1);
+
+Gprime = [-Lsym / (Fsym^2) * Vnx;
+           (1 / Fsym) * Vnx;
+           zeroNx];
+Hprime = [-Asym / (Fsym^2) * Vnx;
+           zeroNx;
+           (1 / Fsym) * Vnx];
+
+Tgrad = [Gprime, Hprime];
+PsiThetaOL = Hsym^(-1) * Tgrad * [1 0; 0 1];
+PsiThetaCL = Hsym^(-1) * Tgrad * [Gur Gue; 0 1];
+
+FIM_OL = covar(PsiThetaOL, [sigmaR 0; 0 sigmaE]);
+FIM_CL = covar(PsiThetaCL, [sigmaR 0; 0 sigmaE]);
+
+%% Preallocate outputs
+numSamples = numel(sampleSet);
+
+varCrlbThetaOL = zeros(1, numSamples);
+varCrlbAOL = zeros(1, numSamples);
+varWnsfThetaOL = zeros(1, numSamples);
+varWnsfAOL = zeros(1, numSamples);
+
+varCrlbThetaCL = zeros(1, numSamples);
+varCrlbACL = zeros(1, numSamples);
+varWnsfThetaCL = zeros(1, numSamples);
+varWnsfACL = zeros(1, numSamples);
+
+covWnsfThetaOL = zeros(numTheta, numTheta, numSamples);
+covWnsfAOL = zeros(nx, nx, numSamples);
+covWnsfThetaCL = zeros(numTheta, numTheta, numSamples);
+covWnsfACL = zeros(nx, nx, numSamples);
+
+%% Monte Carlo simulation
+for sampleIdx = 1:numSamples
+    numData = sampleSet(sampleIdx);
+    hoarxOrder = hoarxOrderSet(sampleIdx);
+    t = (0:numData-1).';
+
+    thetaErrWnsfOL = zeros(numTheta, numIterations);
+    aErrWnsfOL = zeros(nx, numIterations);
+    thetaErrWnsfCL = zeros(numTheta, numIterations);
+    aErrWnsfCL = zeros(nx, numIterations);
+
+    % Keep the same reference input for all Monte Carlo runs at this sample size,
+    % matching the original experiment design. The disturbance changes per run.
+    r = randn(numData, 1);
+
+    for mcIdx = 1:numIterations
+        fprintf("sample=%5d | MC %4d/%4d\n", numData, mcIdx, numIterations);
+
+        %% Open-loop experiment
+        uOL = r;
+        eOL = randn(numData, 1);
+        yOL = lsim(OL, [uOL, eOL], t);
+
+        thetaHatOL = estimateArmaxTheta(uOL, yOL, nx, hoarxOrder);
+        thetaErrWnsfOL(:, mcIdx) = thetaHatOL(:) - thetaTrue(:);
+        aErrWnsfOL(:, mcIdx) = thetaHatOL(2*nx+1:end).' - aTrue(:);
+
+        %% Closed-loop experiment
+        % Generate eCL before using it in the closed-loop input. In the original
+        % script, e was reused from the previous open-loop section when u was
+        % computed, then overwritten before y was generated.
+        eCL = randn(numData, 1);
+        uCL = lsim(Gur, r, t) + lsim(Gue, eCL, t);
+        yCL = lsim(OL, [uCL, eCL], t);
+
+        thetaHatCL = estimateArmaxTheta(uCL, yCL, nx, hoarxOrder);
+        thetaErrWnsfCL(:, mcIdx) = thetaHatCL(:) - thetaTrue(:);
+        aErrWnsfCL(:, mcIdx) = thetaHatCL(2*nx+1:end).' - aTrue(:);
+    end
+
+    %% Open-loop results
+    covThetaCrlbOL = FIM_OL \ eye(numTheta) / numData;
+    covACrlbOL = covThetaCrlbOL(2*nx+1:end, 2*nx+1:end);
+
+    varCrlbThetaOL(sampleIdx) = trace(covThetaCrlbOL);
+    varCrlbAOL(sampleIdx) = trace(covACrlbOL);
+
+    covWnsfThetaOL(:, :, sampleIdx) = thetaErrWnsfOL * thetaErrWnsfOL.' / numIterations;
+    covWnsfAOL(:, :, sampleIdx) = aErrWnsfOL * aErrWnsfOL.' / numIterations;
+
+    varWnsfThetaOL(sampleIdx) = trace(covWnsfThetaOL(:, :, sampleIdx));
+    varWnsfAOL(sampleIdx) = trace(covWnsfAOL(:, :, sampleIdx));
+
+    %% Closed-loop results
+    covThetaCrlbCL = FIM_CL \ eye(numTheta) / numData;
+    covACrlbCL = covThetaCrlbCL(2*nx+1:end, 2*nx+1:end);
+
+    varCrlbThetaCL(sampleIdx) = trace(covThetaCrlbCL);
+    varCrlbACL(sampleIdx) = trace(covACrlbCL);
+
+    covWnsfThetaCL(:, :, sampleIdx) = thetaErrWnsfCL * thetaErrWnsfCL.' / numIterations;
+    covWnsfACL(:, :, sampleIdx) = aErrWnsfCL * aErrWnsfCL.' / numIterations;
+
+    varWnsfThetaCL(sampleIdx) = trace(covWnsfThetaCL(:, :, sampleIdx));
+    varWnsfACL(sampleIdx) = trace(covWnsfACL(:, :, sampleIdx));
+end
+
+%% Save results
+results = struct();
+results.seed = seed;
+results.sampleSet = sampleSet;
+results.hoarxOrderSet = hoarxOrderSet;
+results.numIterations = numIterations;
+results.thetaTrue = thetaTrue;
+results.varCrlbThetaOL = varCrlbThetaOL;
+results.varWnsfThetaOL = varWnsfThetaOL;
+results.varCrlbThetaCL = varCrlbThetaCL;
+results.varWnsfThetaCL = varWnsfThetaCL;
+results.varCrlbAOL = varCrlbAOL;
+results.varWnsfAOL = varWnsfAOL;
+results.varCrlbACL = varCrlbACL;
+results.varWnsfACL = varWnsfACL;
+results.covWnsfThetaOL = covWnsfThetaOL;
+results.covWnsfThetaCL = covWnsfThetaCL;
+results.covWnsfAOL = covWnsfAOL;
+results.covWnsfACL = covWnsfACL;
+
+save(fullfile(outputDir, "siso_counter_crlb_results.mat"), "results");
+
+%% Plot theta MSE against CRLB
+fig = figure("Name", "SISO counter CRLB", "Color", "w");
+h1 = loglog(sampleSet, varCrlbThetaOL, "k--", "LineWidth", lineWidth);
+hold on;
+h2 = loglog(sampleSet, varWnsfThetaOL, "k-", "LineWidth", lineWidth);
+h3 = loglog(sampleSet, varCrlbThetaCL, "k:", "LineWidth", 1.5 * lineWidth);
+h4 = loglog(sampleSet, varWnsfThetaCL, "k-.", "LineWidth", lineWidth);
+grid on;
+
+ax = gca;
+ax.Box = "off";
+ax.TickDir = "out";
+ax.LineWidth = 1.2;
+ax.FontName = "Times";
+ax.FontSize = fontSize;
+
+xlabel("N", "FontSize", fontSize);
+ylabel("MSE", "FontSize", fontSize);
+legend([h1, h2, h3, h4], ...
+       "CRLB (OL)", "WNSFss (OL)", "CRLB (CL)", "WNSFss (CL)", ...
+       "Location", "northeast", "Interpreter", "latex", "Box", "off");
+
+savefig(fig, fullfile(outputDir, "siso_counter_crlb.fig"));
+exportgraphics(fig, fullfile(outputDir, "siso_counter_crlb.pdf"), "ContentType", "vector");
+exportgraphics(fig, fullfile(outputDir, "siso_counter_crlb.png"), "Resolution", 300);
+
+%% Local helper function
+function thetaHat = estimateArmaxTheta(u, y, nx, hoarxOrder)
+%ESTIMATEARMAXTHETA Estimate [f, b, a] from input/output data using WNSF.
+%
+% This helper converts the innovation-form model returned by Func_WNSF_SISO2
+% into the ARMAX parameter vector used in this experiment.
+
+    [Ahat, Bhat, Chat, ~, Khat] = Func_WNSF_SISO(u, y, nx, hoarxOrder);
+
+    AKhat = Ahat - Khat * Chat;
+    aHat = -(AKhat(:, 1)).';
+    bHat = Bhat.';
+    kHat = Khat.';
+    fHat = aHat - kHat;
+
+    thetaHat = [fHat, bHat, aHat];
+end
