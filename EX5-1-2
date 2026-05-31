@@ -1,0 +1,483 @@
+%% run_mimo232_wnsf_crlb_standardized.m
+% RUN_MIMO232_WNSF_CRLB_STANDARDIZED
+%
+% Reproducible Monte Carlo comparison between WNSF parameter-estimation
+% performance and the theoretical CRLB for a 2-output, 3-state MIMO
+% innovation-form system.
+%
+% This script merges three steps into one workflow:
+%   1. Simulate open-loop and closed-loop data and compute WNSF MSE.
+%   2. Compute theoretical CRLB for the same open-loop and closed-loop setup.
+%   3. Plot and save the comparison.
+%
+% PEM is intentionally not used.
+%
+% Requirements:
+%   - MATLAB Control System Toolbox
+%   - MATLAB System Identification Toolbox, if Func_WNSF_MIMO232_V3 depends
+%     on any System Identification Toolbox functions
+%   - Func_WNSF_MIMO232_V3.m available on the MATLAB path
+%
+% Reproducibility:
+%   The random-number generator is fixed by rng(seed,'twister'). The seed,
+%   initial RNG state, final RNG state, configuration, and results are saved
+%   to the output directory.
+
+clearvars;
+close all;
+clc;
+
+%% Configuration
+config = struct();
+
+config.seed = 20240531;
+rng(config.seed, 'twister');
+rngStateInitial = rng;
+
+config.sampleTime = 1;
+config.sampleSet = [600 1000 6000 10000 60000 100000];
+config.hoarxOrderSet = 60:20:160;
+% to be continued
+config.numIterations = 100;
+
+config.outputDir = fullfile(pwd, 'results_mimo232_wnsf_crlb');
+if ~exist(config.outputDir, 'dir')
+    mkdir(config.outputDir);
+end
+
+% Plot settings
+plotConfig = struct();
+plotConfig.markerSize = 5;
+plotConfig.lineWidth = 1;
+plotConfig.fontSize = 12;
+plotConfig.fontName = 'Times';
+
+if numel(config.hoarxOrderSet) < numel(config.sampleSet)
+    error('config.hoarxOrderSet must contain at least as many entries as config.sampleSet.');
+end
+
+%% System definition: 2-output, 3-state MIMO case
+A_K_true = [0.4 0.1 0;
+            0   0   1;
+            0.5 0.2 0.6];
+
+B_true = [1   0.3;
+          0.2 1;
+          0.5 -0.5];
+
+C_true = [1 0 0;
+          0 1 0];
+
+D_true = zeros(2, 2);
+
+% Innovation gain design
+pPole = 0.5;
+desiredPoles = [pPole + pPole*1i, pPole - pPole*1i, 0.3];
+K_true = -place(A_K_true', C_true', desiredPoles)';
+
+A_true = A_K_true + K_true*C_true;
+
+% Static output-feedback controller:
+%   u(t) = r(t) - F_b*y(t)
+F_b = [0.1 0;
+       0   0.1];
+
+% Dimensions
+n_x = size(A_true, 1);
+n_u = size(B_true, 2);
+n_y = size(C_true, 1);
+n_e = n_y;
+n_theta = 2*n_x + n_x*n_u + n_x*n_y;
+
+assert(n_x == 3, 'This script assumes the MIMO232 parameterization with n_x = 3.');
+assert(n_y == 2, 'This script assumes the MIMO232 parameterization with n_y = 2.');
+assert(all(size(F_b) == [n_u n_y]), 'F_b must have size n_u-by-n_y.');
+
+% True parameter vector. This order must match Func_WNSF_MIMO232_V3 and the
+% theoretical CRLB routine below:
+%   [A_K row 1, A_K row 3, row-wise B, row-wise K]
+thetaTrue = packThetaMIMO232(A_K_true, B_true, K_true);
+
+if numel(thetaTrue) ~= n_theta
+    error('Unexpected parameter-vector length.');
+end
+
+%% State-space models for simulation
+% Open-loop model with inputs [u, e] and output y = Cx + e.
+sysOL = ss(A_true, [B_true K_true], C_true, [D_true eye(n_y)], config.sampleTime);
+
+% Closed-loop model with inputs [r, e] and output y = Cx + e.
+% Since u = r - F_b*y and y = Cx + e:
+%   x+ = (A_true - B_true*F_b*C_true)x + B_true*r + (K_true - B_true*F_b)e.
+A_cl = A_true - B_true*F_b*C_true;
+K_cl = K_true - B_true*F_b;
+sysCL = ss(A_cl, [B_true K_cl], C_true, [zeros(n_y, n_u) eye(n_y)], config.sampleTime);
+
+fprintf('Open-loop poles:\n');
+disp(eig(A_true).');
+fprintf('Closed-loop poles:\n');
+disp(eig(A_cl).');
+
+%% Theoretical CRLB for the same sample sizes
+[crlbThetaOL, crlbThetaCL, crlbDetails] = computeCrLBMIMO232( ...
+    A_K_true, B_true, C_true, K_true, F_b, config.sampleSet);
+
+%% Monte Carlo WNSF simulation
+numSamples = numel(config.sampleSet);
+
+C_wnsf_theta_OL = zeros(n_theta, n_theta, numSamples);
+C_wnsf_theta_CL = zeros(n_theta, n_theta, numSamples);
+
+var_wnsf_theta_OL = zeros(1, numSamples);
+var_wnsf_theta_CL = zeros(1, numSamples);
+
+for sampleIdx = 1:numSamples
+    N = config.sampleSet(sampleIdx);
+    n_HOARX = config.hoarxOrderSet(sampleIdx);
+
+    fprintf('\nN = %d, n_HOARX = %d\n', N, n_HOARX);
+
+    t = (0:N-1)';
+
+    thetaErrWnsfOL = zeros(n_theta, config.numIterations);
+    thetaErrWnsfCL = zeros(n_theta, config.numIterations);
+
+    % Keep the same reference signal for all Monte Carlo runs at this N.
+    % This matches the original experiment design and reduces one source of
+    % variability across Monte Carlo iterations.
+    r = randn(N, n_u);
+
+    for mc = 1:config.numIterations
+        fprintf('  MC %4d/%4d\n', mc, config.numIterations);
+
+        %% Open-loop data
+        uOL = r;
+        eOL = randn(N, n_e);
+        yOL = lsim(sysOL, [uOL eOL], t);
+
+        [AhatOL, BhatOL, ChatOL, ~, KhatOL] = Func_WNSF_MIMO232( ...
+            uOL, yOL, n_x, n_HOARX, 1);
+
+        A_K_hat_OL = AhatOL - KhatOL*ChatOL;
+        thetaHatOL = packThetaMIMO232(A_K_hat_OL, BhatOL, KhatOL);
+        thetaErrWnsfOL(:, mc) = thetaHatOL(:) - thetaTrue(:);
+
+        %% Closed-loop data
+        eCL = randn(N, n_e);
+        yCL = lsim(sysCL, [r eCL], t);
+        uCL = r - yCL*F_b';
+
+        [AhatCL, BhatCL, ChatCL, ~, KhatCL] = Func_WNSF_MIMO232( ...
+            uCL, yCL, n_x, n_HOARX, 1);
+
+        A_K_hat_CL = AhatCL - KhatCL*ChatCL;
+        thetaHatCL = packThetaMIMO232(A_K_hat_CL, BhatCL, KhatCL);
+        thetaErrWnsfCL(:, mc) = thetaHatCL(:) - thetaTrue(:);
+    end
+
+    C_wnsf_theta_OL(:, :, sampleIdx) = (thetaErrWnsfOL*thetaErrWnsfOL.')/config.numIterations;
+    C_wnsf_theta_CL(:, :, sampleIdx) = (thetaErrWnsfCL*thetaErrWnsfCL.')/config.numIterations;
+
+    var_wnsf_theta_OL(sampleIdx) = trace(C_wnsf_theta_OL(:, :, sampleIdx));
+    var_wnsf_theta_CL(sampleIdx) = trace(C_wnsf_theta_CL(:, :, sampleIdx));
+end
+
+rngStateFinal = rng;
+
+%% Save results and reproducibility metadata
+resultFile = fullfile(config.outputDir, 'mimo232_wnsf_crlb_results.mat');
+save(resultFile, ...
+    'config', 'plotConfig', ...
+    'rngStateInitial', 'rngStateFinal', ...
+    'A_K_true', 'A_true', 'B_true', 'C_true', 'D_true', 'K_true', 'F_b', ...
+    'sysOL', 'sysCL', 'thetaTrue', ...
+    'crlbThetaOL', 'crlbThetaCL', 'crlbDetails', ...
+    'C_wnsf_theta_OL', 'C_wnsf_theta_CL', ...
+    'var_wnsf_theta_OL', 'var_wnsf_theta_CL');
+
+seedFile = fullfile(config.outputDir, 'random_seed.txt');
+fid = fopen(seedFile, 'w');
+if fid == -1
+    warning('Could not write random_seed.txt.');
+else
+    fprintf(fid, 'seed = %d\n', config.seed);
+    fprintf(fid, 'rng_generator = twister\n');
+    fprintf(fid, 'The complete initial and final RNG states are saved in %s\n', resultFile);
+    fclose(fid);
+end
+
+%% Plot comparison
+figOL = figure('Name', 'MIMO232 Open-loop WNSF vs CRLB');
+h1 = loglog(config.sampleSet, crlbThetaOL, 'k--', 'LineWidth', plotConfig.lineWidth);
+hold on;
+h2 = loglog(config.sampleSet, var_wnsf_theta_OL, 'k-', 'LineWidth', plotConfig.lineWidth);
+formatAxes(plotConfig);
+xlabel('N', 'FontSize', plotConfig.fontSize);
+ylabel('MSE', 'FontSize', plotConfig.fontSize);
+legend([h1 h2], 'CRLB(OL)', 'WNSFss(OL)', ...
+    'Location', 'Northeast', 'Interpreter', 'latex');
+legend('boxoff');
+
+figCL = figure('Name', 'MIMO232 Closed-loop WNSF vs CRLB');
+h3 = loglog(config.sampleSet, crlbThetaCL, 'k:', 'LineWidth', 1.5*plotConfig.lineWidth);
+hold on;
+h4 = loglog(config.sampleSet, var_wnsf_theta_CL, 'k-.', 'LineWidth', plotConfig.lineWidth);
+formatAxes(plotConfig);
+xlabel('N', 'FontSize', plotConfig.fontSize);
+ylabel('MSE', 'FontSize', plotConfig.fontSize);
+legend([h3 h4], 'CRLB(CL)', 'WNSFss(CL)', ...
+    'Location', 'Northeast', 'Interpreter', 'latex');
+legend('boxoff');
+
+figCombined = figure('Name', 'MIMO232 WNSF vs CRLB: Open-loop and Closed-loop');
+h1 = loglog(config.sampleSet, crlbThetaOL, 'k--', 'LineWidth', plotConfig.lineWidth);
+hold on;
+h2 = loglog(config.sampleSet, var_wnsf_theta_OL, 'k-', 'LineWidth', plotConfig.lineWidth);
+h3 = loglog(config.sampleSet, crlbThetaCL, 'k:', 'LineWidth', 1.5*plotConfig.lineWidth);
+h4 = loglog(config.sampleSet, var_wnsf_theta_CL, 'k-.', 'LineWidth', plotConfig.lineWidth);
+formatAxes(plotConfig);
+xlabel('N', 'FontSize', plotConfig.fontSize);
+ylabel('MSE', 'FontSize', plotConfig.fontSize);
+legend([h1 h2 h3 h4], 'CRLB(OL)', 'WNSFss(OL)', 'CRLB(CL)', 'WNSFss(CL)', ...
+    'Location', 'Northeast', 'Interpreter', 'latex');
+legend('boxoff');
+
+saveFigureSet(figOL, config.outputDir, 'mimo232_open_loop_wnsf_vs_crlb');
+saveFigureSet(figCL, config.outputDir, 'mimo232_closed_loop_wnsf_vs_crlb');
+saveFigureSet(figCombined, config.outputDir, 'mimo232_combined_wnsf_vs_crlb');
+
+fprintf('\nDone. Results saved to:\n  %s\n', config.outputDir);
+
+%% Local functions
+function theta = packThetaMIMO232(A_K, B, K)
+%PACKTHETAMIMO232 Parameter vector used by the MIMO232 example.
+%
+% The vectorization is row-wise for B and K:
+%   reshape(B.', 1, []) = [B(1,1), B(1,2), B(2,1), ...].
+    theta = [A_K(1, :) A_K(3, :) reshape(B.', 1, []) reshape(K.', 1, [])];
+end
+
+function [crlbThetaOL, crlbThetaCL, details] = computeCrLBMIMO232(A_K, B, C, K, F, sampleSet)
+%COMPUTECRLBMIMO232 Theoretical CRLB for the MIMO232 parameterization.
+%
+% Parameter order:
+%   theta = [A_K row 1, A_K row 3, row-wise B, row-wise K].
+%
+% The open-loop model is
+%   x+ = A*x + B*u + K*e,    y = C*x + e
+% with A = A_K + K*C.
+%
+% The closed-loop controller is
+%   u = r - F*y.
+%
+% This routine is the generalized, code-based version of the symbolic CRLB
+% script, and it supports the 2-input setup used by the Monte Carlo section.
+
+    n_x = size(A_K, 1);
+    n_u = size(B, 2);
+    n_y = size(C, 1);
+
+    A = A_K + K*C;
+
+    numAParams = 2*n_x;
+    numBParams = n_x*n_u;
+    numKParams = n_x*n_y;
+    n_theta = numAParams + numBParams + numKParams;
+
+    [A_prime, B_prime, K_prime, R1_prime] = buildDerivativeMatrices( ...
+        A_K, B, C, K, n_theta, numAParams, numBParams);
+
+    % Innovation covariance setup, following the original theoretical CRLB
+    % derivation. For an innovation-form system with unit innovation
+    % covariance, R1 = K*K', R12 = K, R2 = I.
+    R1 = K*K.';
+    R12 = K;
+    R2 = eye(n_y);
+
+    [P_true, K_idare] = idare(A.', C.', R1, R2, R12, eye(n_x));
+    K_idare = K_idare.';
+
+    if norm(K_idare - K, 'fro') > 1e-7
+        warning(['The Kalman gain returned by idare differs from K. ', ...
+                 'The CRLB computation will still use the K supplied to this function.']);
+    end
+
+    P_prime = cell(1, n_theta);
+    for iParam = 1:n_theta
+        R1_i = R1_prime{iParam};
+        R12_i = K_prime{iParam};
+        A_i = A_prime{iParam};
+
+        temp_i = (R1_i - K*R12_i.' - R12_i*K.') ...
+            + A_i*P_true*A_K.' + A_K*P_true*A_i.';
+
+        P_prime{iParam} = dlyap(A_K, temp_i); %#ok<AGROW>
+    end
+
+    %% Open-loop CRLB
+    A_o = stackCellMatrices(A_prime);
+    B_o = stackCellMatrices(B_prime);
+    K_o = stackCellMatrices(K_prime);
+
+    A_bf_o = [A zeros(n_x, n_theta*n_x);
+              A_o kron(eye(n_theta), A_K)];
+
+    K_bf_o = [B K;
+              B_o K_o];
+
+    C_bf = [zeros(n_theta*n_y, n_x), -kron(eye(n_theta), C)];
+
+    P_bf_o = dlyap(A_bf_o, K_bf_o*K_bf_o.');
+    covPhiO = C_bf*P_bf_o*C_bf.';
+    fimO = shrinkOutputCovariance(covPhiO, n_theta, n_y);
+
+    crlbScalarOL = trace(fimO \ eye(size(fimO)));
+    crlbThetaOL = crlbScalarOL ./ sampleSet;
+
+    %% Closed-loop CRLB
+    A_cl = A - B*F*C;
+    K_cl = K - B*F;
+
+    A_c_prime = cell(1, n_theta);
+    B_c_prime = cell(1, n_theta);
+    K_c_prime = cell(1, n_theta);
+
+    for iParam = 1:n_theta
+        A_c_prime{iParam} = A_prime{iParam} - B_prime{iParam}*F*C;
+        B_c_prime{iParam} = B_prime{iParam};
+        K_c_prime{iParam} = K_prime{iParam} - B_prime{iParam}*F;
+    end
+
+    A_c = stackCellMatrices(A_c_prime);
+    B_c = stackCellMatrices(B_c_prime);
+    K_c = stackCellMatrices(K_c_prime);
+
+    A_bf_c = [A_cl zeros(n_x, n_theta*n_x);
+              A_c kron(eye(n_theta), A_K)];
+
+    K_bf_c = [B K_cl;
+              B_c K_c];
+
+    P_bf_c = dlyap(A_bf_c, K_bf_c*K_bf_c.');
+    covPhiC = C_bf*P_bf_c*C_bf.';
+    fimC = shrinkOutputCovariance(covPhiC, n_theta, n_y);
+
+    crlbScalarCL = trace(fimC \ eye(size(fimC)));
+    crlbThetaCL = crlbScalarCL ./ sampleSet;
+
+    details = struct();
+    details.P_true = P_true;
+    details.K_idare = K_idare;
+    details.P_prime = {P_prime};
+    details.fimOpenLoop = fimO;
+    details.fimClosedLoop = fimC;
+    details.covPhiOpenLoop = covPhiO;
+    details.covPhiClosedLoop = covPhiC;
+    details.crlbScalarOpenLoop = crlbScalarOL;
+    details.crlbScalarClosedLoop = crlbScalarCL;
+end
+
+function [A_prime, B_prime, K_prime, R1_prime] = buildDerivativeMatrices( ...
+    A_K, B, C, K, n_theta, numAParams, numBParams)
+%BUILDDERIVATIVEMATRICES Derivatives for the MIMO232 parameter vector.
+
+    n_x = size(A_K, 1);
+    n_u = size(B, 2);
+    n_y = size(C, 1);
+
+    A_prime = cell(1, n_theta);
+    B_prime = cell(1, n_theta);
+    K_prime = cell(1, n_theta);
+    R1_prime = cell(1, n_theta);
+
+    for iParam = 1:n_theta
+        dA_K = zeros(n_x, n_x);
+        dB = zeros(n_x, n_u);
+        dK = zeros(n_x, n_y);
+
+        if iParam <= numAParams
+            % First n_x parameters: row 1 of A_K.
+            % Next  n_x parameters: row 3 of A_K.
+            if iParam <= n_x
+                rowIdx = 1;
+                colIdx = iParam;
+            else
+                rowIdx = 3;
+                colIdx = iParam - n_x;
+            end
+            dA_K(rowIdx, colIdx) = 1;
+
+        elseif iParam <= numAParams + numBParams
+            localIdx = iParam - numAParams;
+            [rowIdx, colIdx] = rowWiseIndex(localIdx, n_u);
+            dB(rowIdx, colIdx) = 1;
+
+        else
+            localIdx = iParam - numAParams - numBParams;
+            [rowIdx, colIdx] = rowWiseIndex(localIdx, n_y);
+            dK(rowIdx, colIdx) = 1;
+        end
+
+        A_prime{iParam} = dA_K + dK*C;
+        B_prime{iParam} = dB;
+        K_prime{iParam} = dK;
+        R1_prime{iParam} = dK*K.' + K*dK.';
+    end
+end
+
+function [rowIdx, colIdx] = rowWiseIndex(localIdx, numCols)
+%ROWWISEINDEX Convert row-wise vector index to matrix subscripts.
+    rowIdx = floor((localIdx - 1)/numCols) + 1;
+    colIdx = mod(localIdx - 1, numCols) + 1;
+end
+
+function out = stackCellMatrices(matrixCell)
+%STACKCELLMATRICES Vertically stack matrices stored in a cell array.
+    out = matrixCell{1};
+    for ii = 2:numel(matrixCell)
+        out = [out; matrixCell{ii}]; %#ok<AGROW>
+    end
+end
+
+function fim = shrinkOutputCovariance(covPhi, n_theta, n_y)
+%SHRINKOUTPUTCOVARIANCE Sum same-output-channel covariance contributions.
+%
+% The original derivation forms a covariance over parameter-output channels.
+% This function maps it to an n_theta-by-n_theta Fisher-information-like
+% matrix by summing the diagonal output-channel contributions.
+
+    fim = zeros(n_theta, n_theta);
+
+    for iTheta = 1:n_theta
+        for jTheta = 1:n_theta
+            value = 0;
+            for outputIdx = 1:n_y
+                rowIdx = n_y*(iTheta - 1) + outputIdx;
+                colIdx = n_y*(jTheta - 1) + outputIdx;
+                value = value + covPhi(rowIdx, colIdx);
+            end
+            fim(iTheta, jTheta) = value;
+        end
+    end
+end
+
+function formatAxes(plotConfig)
+%FORMATAXES Apply consistent figure styling.
+    ax = gca;
+    ax.Box = 'off';
+    ax.TickDir = 'out';
+    ax.LineWidth = 1.2;
+    ax.FontName = plotConfig.fontName;
+    ax.FontSize = plotConfig.fontSize;
+end
+
+function saveFigureSet(figHandle, outputDir, baseName)
+%SAVEFIGURESET Save one figure as FIG, PNG, and PDF.
+    figFile = fullfile(outputDir, [baseName '.fig']);
+    pngFile = fullfile(outputDir, [baseName '.png']);
+    pdfFile = fullfile(outputDir, [baseName '.pdf']);
+
+    savefig(figHandle, figFile);
+    print(figHandle, pngFile, '-dpng', '-r300');
+    print(figHandle, pdfFile, '-dpdf', '-bestfit');
+end
