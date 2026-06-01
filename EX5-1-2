@@ -79,8 +79,8 @@ A_true = A_K_true + K_true*C_true;
 
 % Static output-feedback controller:
 %   u(t) = r(t) - F_b*y(t)
-F_b = [0.1 0;
-       0   0.1];
+F_b = [0.5 0;
+       0   0.5];
 
 % Dimensions
 n_x = size(A_true, 1);
