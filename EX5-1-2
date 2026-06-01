@@ -39,7 +39,7 @@ rngStateInitial = rng;
 config.sampleTime = 1;
 config.sampleSet = [600 1000 6000 10000 60000 100000];
 config.hoarxOrderSet = 60:20:200;
-config.numIterations = 50;
+config.numIterations = 100;
 
 config.outputDir = fullfile(pwd, 'results_mimo232_wnsf_crlb_fixed');
 if ~exist(config.outputDir, 'dir')
